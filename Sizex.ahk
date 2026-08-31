@@ -9,6 +9,7 @@ global IniFile := A_ScriptDir "\Sizex.ini"
 global CurrentHotkey := ""
 global SettingsGuiObj := ""
 global HotkeyRecorderHook := ""
+global MouseRecordList := ["*MButton", "*RButton", "*XButton1", "*XButton2", "*WheelUp", "*WheelDown", "*LButton"]
 
 ; --- 全域變數：追蹤目前是否正在拖拉視窗 ---
 global IsWindowMoving := false
@@ -75,7 +76,7 @@ ApplyGlobalHotkey(newHk, silent := false) {
 }
 
 ; ------------------------------------------------------------------------------
-; 熱鍵代碼轉換為易讀文字 (如 ^#z -> Ctrl + Win + Z)
+; 熱鍵代碼轉換為易讀文字 (如 ^#z -> Ctrl + Win + Z, ^MButton -> Ctrl + 滑鼠中鍵)
 ; ------------------------------------------------------------------------------
 HotkeyToHumanReadable(hk) {
     if (hk == "")
@@ -113,10 +114,23 @@ HotkeyToHumanReadable(hk) {
         res.Push("Win")
 
     if (temp != "") {
-        if (StrLen(temp) == 1)
+        mouseMap := Map(
+            "mbutton", "滑鼠中鍵 (MButton)",
+            "rbutton", "滑鼠右鍵 (RButton)",
+            "lbutton", "滑鼠左鍵 (LButton)",
+            "xbutton1", "滑鼠側鍵1 (XButton1)",
+            "xbutton2", "滑鼠側鍵2 (XButton2)",
+            "wheelup", "滾輪向上 (WheelUp)",
+            "wheeldown", "滾輪向下 (WheelDown)"
+        )
+        lowerTemp := StrLower(temp)
+        if (mouseMap.Has(lowerTemp)) {
+            res.Push(mouseMap[lowerTemp])
+        } else if (StrLen(temp) == 1) {
             res.Push(StrUpper(temp))
-        else
+        } else {
             res.Push(temp)
+        }
     }
 
     out := ""
@@ -202,7 +216,7 @@ ShowSettingsGui(*) {
     sg.Add("Text", "x45 y110 w100 h25", "AHK 格式代碼：")
     txtAhkCode := sg.Add("Edit", "x150 y107 w330 h26 ReadOnly Center", CurrentHotkey)
 
-    btnRecord := sg.Add("Button", "x45 y150 w435 h42", "🎯 點擊開始錄製按鍵 (請直接按下組合鍵)")
+    btnRecord := sg.Add("Button", "x45 y150 w435 h42", "🎯 點擊開始錄製按鍵 (支援鍵盤組合鍵與滑鼠按鍵)")
     btnRecord.SetFont("s10 bold", "Segoe UI")
 
     btnSaveHk := sg.Add("Button", "x45 y230 w150 h36 Default", "💾 儲存並套用熱鍵")
@@ -257,32 +271,53 @@ ShowSettingsGui(*) {
 }
 
 ; ------------------------------------------------------------------------------
-; 熱鍵錄製功能
+; 熱鍵與滑鼠錄製功能
 ; ------------------------------------------------------------------------------
 StartHotkeyRecording(btnRecord, editDisplay, txtAhkCode) {
     global HotkeyRecorderHook
-    if (HotkeyRecorderHook != "") {
-        try HotkeyRecorderHook.Stop()
-    }
+    StopAllRecording()
 
-    btnRecord.Text := "🔴 請按下任意組合鍵... (按 Esc 取消)"
+    btnRecord.Text := "🔴 請按下按鍵或滑鼠鍵... (按 Esc 取消)"
     btnRecord.Enabled := false
 
+    ; 1. 啟用鍵盤輸入監聽
     HotkeyRecorderHook := InputHook("V")
     HotkeyRecorderHook.KeyOpt("{All}", "+N +S")
     HotkeyRecorderHook.OnKeyDown := (hook, vk, sc) => ProcessRecordKeyDown(hook, vk, sc, btnRecord, editDisplay, txtAhkCode)
     HotkeyRecorderHook.Start()
+
+    ; 2. 啟用滑鼠按鍵監聽
+    ToggleMouseRecorder(true, (thisHk) => ProcessMouseKeyDown(thisHk, btnRecord, editDisplay, txtAhkCode))
+}
+
+ToggleMouseRecorder(enable, callback := "") {
+    global MouseRecordList
+    for hk in MouseRecordList {
+        try {
+            if (enable)
+                Hotkey(hk, callback, "On")
+            else
+                Hotkey(hk, "Off")
+        }
+    }
+}
+
+StopAllRecording() {
+    global HotkeyRecorderHook
+    if (HotkeyRecorderHook != "") {
+        try HotkeyRecorderHook.Stop()
+        HotkeyRecorderHook := ""
+    }
+    ToggleMouseRecorder(false)
 }
 
 ProcessRecordKeyDown(hook, vk, sc, btnRecord, editDisplay, txtAhkCode) {
-    global HotkeyRecorderHook
     keyName := GetKeyName(Format("vk{:02x}sc{:03x}", vk, sc))
 
     ; 按 Esc 取消錄製
     if (keyName = "Escape" && !GetKeyState("Ctrl", "P") && !GetKeyState("Alt", "P") && !GetKeyState("Shift", "P") && !GetKeyState("LWin", "P") && !GetKeyState("RWin", "P")) {
-        hook.Stop()
-        HotkeyRecorderHook := ""
-        btnRecord.Text := "🎯 點擊開始錄製按鍵 (請直接按下組合鍵)"
+        StopAllRecording()
+        btnRecord.Text := "🎯 點擊開始錄製按鍵 (支援鍵盤組合鍵與滑鼠按鍵)"
         btnRecord.Enabled := true
         return
     }
@@ -309,8 +344,36 @@ ProcessRecordKeyDown(hook, vk, sc, btnRecord, editDisplay, txtAhkCode) {
     baseKey := (StrLen(keyName) == 1) ? StrLower(keyName) : keyName
     capturedHk := modStr . baseKey
 
-    hook.Stop()
-    HotkeyRecorderHook := ""
+    StopAllRecording()
+
+    editDisplay.Value := HotkeyToHumanReadable(capturedHk)
+    txtAhkCode.Value := capturedHk
+    btnRecord.Text := "🎯 點擊重新錄製按鍵"
+    btnRecord.Enabled := true
+}
+
+ProcessMouseKeyDown(thisHk, btnRecord, editDisplay, txtAhkCode) {
+    cleanHk := RegExReplace(thisHk, "^\*")
+
+    ; 若無修飾鍵且點擊左鍵，視為一般點擊操作不進行綁定
+    hasMod := (GetKeyState("Ctrl", "P") || GetKeyState("Alt", "P") || GetKeyState("Shift", "P") || GetKeyState("LWin", "P") || GetKeyState("RWin", "P"))
+    if (cleanHk = "LButton" && !hasMod) {
+        return
+    }
+
+    modStr := ""
+    if GetKeyState("Ctrl", "P")
+        modStr .= "^"
+    if GetKeyState("Alt", "P")
+        modStr .= "!"
+    if GetKeyState("Shift", "P")
+        modStr .= "+"
+    if (GetKeyState("LWin", "P") || GetKeyState("RWin", "P"))
+        modStr .= "#"
+
+    capturedHk := modStr . cleanHk
+
+    StopAllRecording()
 
     editDisplay.Value := HotkeyToHumanReadable(capturedHk)
     txtAhkCode.Value := capturedHk
@@ -325,15 +388,12 @@ OnSaveSettings(newHk) {
 OnResetSettings(btnRecord, editDisplay, txtAhkCode) {
     editDisplay.Value := HotkeyToHumanReadable("^#z")
     txtAhkCode.Value := "^#z"
-    btnRecord.Text := "🎯 點擊開始錄製按鍵 (請直接按下組合鍵)"
+    btnRecord.Text := "🎯 點擊開始錄製按鍵 (支援鍵盤組合鍵與滑鼠按鍵)"
 }
 
 OnSettingsClose(guiObj, *) {
-    global SettingsGuiObj, HotkeyRecorderHook
-    if (HotkeyRecorderHook != "") {
-        try HotkeyRecorderHook.Stop()
-        HotkeyRecorderHook := ""
-    }
+    global SettingsGuiObj
+    StopAllRecording()
     SettingsGuiObj := ""
     try guiObj.Destroy()
 }
