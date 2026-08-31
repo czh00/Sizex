@@ -22,6 +22,9 @@ InitGlobalHotkey()
 ; --- 啟動 WinEvent 系統事件監聽 ---
 SetWinEventHook()
 
+; --- 啟動時自動恢復已有紀錄之視窗位置 ---
+SetTimer RestoreAllSavedWindows, -200
+
 ; ------------------------------------------------------------------------------
 ; 托盤選單初始化 (右鍵選單僅保留「設定」與「離開」)
 ; ------------------------------------------------------------------------------
@@ -486,6 +489,7 @@ ImportIniFile(lv := "") {
         }
         if (lv != "" && IsObject(lv))
             RefreshProfileListView(lv)
+        RestoreAllSavedWindows()
         MsgBox("已成功匯入並合併 " count " 筆視窗設定！", "匯入成功", "Iconi 64")
     } catch {
         MsgBox("匯入設定檔失敗，請確認檔案格式是否正確。", "錯誤", "Icon! 16")
@@ -712,6 +716,41 @@ OnWindowShow(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsE
             if ((savedExe != "" && StrCompare(exe, savedExe, false) == 0) || (title != "" && InStr(title, sec))) {
                 BindAndSetTimer(sec, hwnd)
                 break
+            }
+        }
+    }
+}
+
+; ------------------------------------------------------------------------------
+; 啟動時自動還原所有已記錄之視窗尺寸與位置
+; ------------------------------------------------------------------------------
+RestoreAllSavedWindows() {
+    sectionsList := GetIniSections(IniFile)
+    if (sectionsList.Length == 0)
+        return
+
+    try {
+        allHwnds := WinGetList()
+        for hwnd in allHwnds {
+            try {
+                style := WinGetStyle("ahk_id " hwnd)
+                if !(style & 0x10000000) ; WS_VISIBLE (只處理可見視窗)
+                    continue
+
+                title := WinGetTitle("ahk_id " hwnd)
+                exe := WinGetProcessName("ahk_id " hwnd)
+                if (title == "" && exe == "")
+                    continue
+
+                for sec in sectionsList {
+                    if (sec == "")
+                        continue
+                    savedExe := IniRead(IniFile, sec, "Exe", "")
+                    if ((savedExe != "" && StrCompare(exe, savedExe, false) == 0) || (title != "" && InStr(title, sec))) {
+                        MoveWindowToTarget(sec, hwnd)
+                        break
+                    }
+                }
             }
         }
     }
