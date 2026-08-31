@@ -600,12 +600,22 @@ MoveWindowToTarget(targetKey, hwnd := 0) {
 
     targetHwnd := 0
     if (hwnd && WinExist("ahk_id " hwnd)) {
-        targetHwnd := hwnd
+        if (IsCandidateMainAppWindow(hwnd))
+            targetHwnd := hwnd
     } else {
         savedExe := IniRead(IniFile, targetKey, "Exe", "")
-        winQuery := (savedExe != "") ? "ahk_exe " savedExe : targetKey
-        if WinExist(winQuery)
-            targetHwnd := WinGetID(winQuery)
+        if (savedExe != "") {
+            for h in WinGetList("ahk_exe " savedExe) {
+                if (IsCandidateMainAppWindow(h)) {
+                    targetHwnd := h
+                    break
+                }
+            }
+        } else if WinExist(targetKey) {
+            hCandidate := WinGetID(targetKey)
+            if (IsCandidateMainAppWindow(hCandidate))
+                targetHwnd := hCandidate
+        }
     }
 
     if (targetHwnd) {
@@ -675,8 +685,8 @@ SetWinEventHook() {
 OnMoveSizeEvent(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime) {
     global IsWindowMoving, MovingHwnd
 
-    ; 只處理標準視窗
-    if (idObject != 0)
+    ; 僅處理標準主視窗，排除輸入法/浮動元件
+    if (idObject != 0 || !hwnd || !IsCandidateMainAppWindow(hwnd))
         return
 
     if (event == 0x000A) { ; EVENT_SYSTEM_MOVESIZESTART (使用者開始拖動或縮放視窗)
@@ -696,7 +706,11 @@ OnMoveSizeEvent(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dw
 ; 新開視窗自動定位處理器
 ; ------------------------------------------------------------------------------
 OnWindowShow(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime) {
-    if (idObject != 0)
+    if (idObject != 0 || !hwnd)
+        return
+
+    ; 徹底過濾：排除小狼毫 IME 候選詞視窗、工具視窗、選單、浮動提示等
+    if (!IsCandidateMainAppWindow(hwnd))
         return
 
     try {
@@ -722,6 +736,53 @@ OnWindowShow(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsE
 }
 
 ; ------------------------------------------------------------------------------
+; 判斷是否為標準應用程式主視窗 (排除小狼毫/系統輸入法候選框、Tooltip、選單、陰影等)
+; ------------------------------------------------------------------------------
+IsCandidateMainAppWindow(hwnd) {
+    if (!hwnd || !WinExist("ahk_id " hwnd))
+        return false
+
+    try {
+        ; 1. 排除輸入法服務進程
+        exe := StrLower(WinGetProcessName("ahk_id " hwnd))
+        if (exe = "weaselserver.exe" || exe = "weaseldeployer.exe" || exe = "textinputhost.exe" || exe = "ctfmon.exe")
+            return false
+
+        ; 2. 排除常見輸入法與浮動視窗類別 (Class)
+        cls := WinGetClass("ahk_id " hwnd)
+        if (cls = "WeaselUIWnd" || cls = "WeaselCandidateWindow" || cls = "MSCTFIME UI" || cls = "IME"
+            || InStr(cls, "tooltips_class") || InStr(cls, "SysShadow") || InStr(cls, "DropShadow")
+            || InStr(cls, "Xaml_WindowedPopupClass") || InStr(cls, "PopupHost") || cls = "ComboLBox")
+            return false
+
+        ; 3. 視窗樣式檢查
+        style := WinGetStyle("ahk_id " hwnd)
+        exStyle := WinGetExStyle("ahk_id " hwnd)
+
+        ; 排除子視窗 (WS_CHILD = 0x40000000)
+        if (style & 0x40000000)
+            return false
+
+        ; 排除工具視窗 (WS_EX_TOOLWINDOW = 0x00000080) 與 無焦點浮動視窗 (WS_EX_NOACTIVATE = 0x08000000)
+        if ((exStyle & 0x00000080) || (exStyle & 0x08000000))
+            return false
+
+        ; 4. 排除擁有 Owner 的彈出子視窗 (輸入法候選欄/下拉框 GW_OWNER != 0，標準主視窗 GW_OWNER == 0)
+        ownerHwnd := DllCall("GetWindow", "Ptr", hwnd, "UInt", 4, "Ptr") ; 4 = GW_OWNER
+        if (ownerHwnd != 0)
+            return false
+
+        ; 5. 必須具備主視窗特徵 (WS_CAPTION = 0x00C00000, WS_THICKFRAME = 0x00040000, WS_EX_APPWINDOW = 0x00040000)
+        if (!(style & 0x00C00000) && !(style & 0x00040000) && !(exStyle & 0x00040000))
+            return false
+
+        return true
+    } catch {
+        return false
+    }
+}
+
+; ------------------------------------------------------------------------------
 ; 啟動時自動還原所有已記錄之視窗尺寸與位置
 ; ------------------------------------------------------------------------------
 RestoreAllSavedWindows() {
@@ -733,8 +794,7 @@ RestoreAllSavedWindows() {
         allHwnds := WinGetList()
         for hwnd in allHwnds {
             try {
-                style := WinGetStyle("ahk_id " hwnd)
-                if !(style & 0x10000000) ; WS_VISIBLE (只處理可見視窗)
+                if (!IsCandidateMainAppWindow(hwnd))
                     continue
 
                 title := WinGetTitle("ahk_id " hwnd)
