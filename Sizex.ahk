@@ -30,6 +30,7 @@ SetTimer RestoreAllSavedWindows, -200
 ; ------------------------------------------------------------------------------
 InitTrayMenu() {
     A_TrayMenu.Delete()
+    A_TrayMenu.Add("🔄 全部歸位", (*) => RestoreAllSavedWindows(true))
     A_TrayMenu.Add("⚙️ 設定", (*) => ShowSettingsGui())
     A_TrayMenu.Add("❌ 離開", (*) => ExitApp())
 }
@@ -148,6 +149,7 @@ HotkeyToHumanReadable(hk) {
 ShowMenu() {
     mainMenu := Menu()
     mainMenu.Add("📌 記住當前焦點視窗位置", SaveCurrentWindow)
+    mainMenu.Add("🔄 全部歸位", (*) => RestoreAllSavedWindows(true))
     mainMenu.Add("⚙️ 設定", (*) => ShowSettingsGui())
     
     sectionsList := GetIniSections(IniFile)
@@ -785,11 +787,17 @@ IsCandidateMainAppWindow(hwnd) {
 ; ------------------------------------------------------------------------------
 ; 啟動時自動還原所有已記錄之視窗尺寸與位置
 ; ------------------------------------------------------------------------------
-RestoreAllSavedWindows() {
+RestoreAllSavedWindows(showTip := false, *) {
     sectionsList := GetIniSections(IniFile)
-    if (sectionsList.Length == 0)
+    if (sectionsList.Length == 0) {
+        if (showTip) {
+            ToolTip("尚無儲存的視窗紀錄")
+            SetTimer ClearToolTip, -1500
+        }
         return
+    }
 
+    count := 0
     try {
         allHwnds := WinGetList()
         for hwnd in allHwnds {
@@ -807,12 +815,21 @@ RestoreAllSavedWindows() {
                         continue
                     savedExe := IniRead(IniFile, sec, "Exe", "")
                     if ((savedExe != "" && StrCompare(exe, savedExe, false) == 0) || (title != "" && InStr(title, sec))) {
-                        MoveWindowToTarget(sec, hwnd)
+                        if (MoveWindowToTarget(sec, hwnd)) {
+                            count++
+                        }
                         break
                     }
                 }
             }
         }
+    }
+    if (showTip) {
+        if (count > 0)
+            ToolTip("已完成全部視窗歸位 (已套用 " count " 個視窗)")
+        else
+            ToolTip("目前未發現相符之已開啟視窗")
+        SetTimer ClearToolTip, -1500
     }
 }
 
