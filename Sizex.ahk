@@ -2,13 +2,22 @@
 #SingleInstance Force
 
 ; ==============================================================================
-; AHK v2 視窗位置記憶與自動定位腳本 (極致修復版)
+; AHK v2 視窗位置記憶與自動定位腳本 (三種熱鍵並存版: 鍵盤 / 滑鼠 / 控制器)
 ; ==============================================================================
 
 global IniFile := A_ScriptDir "\Sizex.ini"
-global CurrentHotkey := ""
+global KeyHotkey := ""
+global MouseHotkey := ""
+global ControllerHotkey := ""
+global ActiveKeyHotkey := ""
+global ActiveMouseHotkey := ""
+global ActiveJoyHotkey := ""
+
 global SettingsGuiObj := ""
-global HotkeyRecorderHook := ""
+global RecordingType := ""
+global ActiveInputHook := ""
+global JoyPollActive := false
+global RecControls := {}
 global MouseRecordList := ["*MButton", "*RButton", "*XButton1", "*XButton2", "*WheelUp", "*WheelDown", "*LButton"]
 
 ; --- 全域變數：追蹤目前是否正在拖拉視窗 ---
@@ -17,7 +26,7 @@ global MovingHwnd := 0
 
 ; --- 初始化設定與托盤圖示 ---
 InitTrayMenu()
-InitGlobalHotkey()
+InitGlobalHotkeys()
 
 ; --- 啟動 WinEvent 系統事件監聽 ---
 SetWinEventHook()
@@ -26,61 +35,207 @@ SetWinEventHook()
 SetTimer RestoreAllSavedWindows, -200
 
 ; ------------------------------------------------------------------------------
-; 托盤選單初始化 (右鍵選單僅保留「設定」與「離開」)
+; 托盤選單初始化 (右鍵選單保留「全部歸位」、「設定」與「離開」)
 ; ------------------------------------------------------------------------------
 InitTrayMenu() {
     A_TrayMenu.Delete()
     A_TrayMenu.Add("🔄 全部歸位", (*) => RestoreAllSavedWindows(true))
     A_TrayMenu.Add("⚙️ 設定", (*) => ShowSettingsGui())
     A_TrayMenu.Add("❌ 離開", (*) => ExitApp())
+    UpdateTrayTip()
+}
+
+UpdateTrayTip() {
+    global KeyHotkey, MouseHotkey, ControllerHotkey
+    tip := "Sizex - 視窗定位工具"
+    keys := []
+    if (KeyHotkey != "")
+        keys.Push("鍵盤:" . KeyHotkey)
+    if (MouseHotkey != "")
+        keys.Push("滑鼠:" . MouseHotkey)
+    if (ControllerHotkey != "")
+        keys.Push("手把:" . ControllerHotkey)
+    if (keys.Length > 0) {
+        tip .= "`n"
+        for i, k in keys
+            tip .= (i == 1 ? "" : " | ") . k
+    }
+    try A_IconTip := SubStr(tip, 1, 127)
 }
 
 ; ------------------------------------------------------------------------------
-; 初始化全域熱鍵
+; 初始化全域熱鍵 (鍵盤、滑鼠、控制器三者並存)
 ; ------------------------------------------------------------------------------
-InitGlobalHotkey() {
-    global CurrentHotkey, IniFile
-    savedHk := IniRead(IniFile, "Settings", "Hotkey", "^#z")
-    if (savedHk == "")
-        savedHk := "^#z"
-    ApplyGlobalHotkey(savedHk, true)
-}
+InitGlobalHotkeys() {
+    global KeyHotkey, MouseHotkey, ControllerHotkey, IniFile
 
-; ------------------------------------------------------------------------------
-; 註冊/更新全域熱鍵
-; ------------------------------------------------------------------------------
-ApplyGlobalHotkey(newHk, silent := false) {
-    global CurrentHotkey, IniFile
-    if (newHk == "")
-        return false
+    legacyHk := IniRead(IniFile, "Settings", "Hotkey", "")
+    KeyHotkey := IniRead(IniFile, "Settings", "KeyHotkey", "")
+    MouseHotkey := IniRead(IniFile, "Settings", "MouseHotkey", "")
+    ControllerHotkey := IniRead(IniFile, "Settings", "ControllerHotkey", "")
 
-    oldHk := CurrentHotkey
-    if (oldHk != "") {
-        try Hotkey(oldHk, "Off")
+    ; 向下相容舊版設定 (若只存有 Hotkey 鍵值)
+    if (KeyHotkey == "" && MouseHotkey == "" && ControllerHotkey == "" && legacyHk != "") {
+        if (IsMouseHotkey(legacyHk)) {
+            MouseHotkey := legacyHk
+            KeyHotkey := "^#z"
+        } else if (IsControllerHotkey(legacyHk)) {
+            ControllerHotkey := legacyHk
+            KeyHotkey := "^#z"
+        } else {
+            KeyHotkey := legacyHk
+        }
+    } else {
+        if (KeyHotkey == "" && legacyHk == "") {
+            KeyHotkey := "^#z"
+        }
     }
 
-    try {
-        Hotkey(newHk, (*) => ShowMenu(), "On")
-        CurrentHotkey := newHk
-        IniWrite(CurrentHotkey, IniFile, "Settings", "Hotkey")
-        if (!silent) {
-            ToolTip("已成功套用熱鍵: " HotkeyToHumanReadable(CurrentHotkey))
+    ApplyAllHotkeys(KeyHotkey, MouseHotkey, ControllerHotkey, true)
+}
+
+; ------------------------------------------------------------------------------
+; 註冊/套用三種熱鍵 (鍵盤、滑鼠、控制器三種同時並存)
+; ------------------------------------------------------------------------------
+ApplyAllHotkeys(newKey, newMouse, newJoy, silent := false) {
+    global KeyHotkey, MouseHotkey, ControllerHotkey, IniFile
+    global ActiveKeyHotkey, ActiveMouseHotkey, ActiveJoyHotkey
+
+    ; 1. 關閉先前的熱鍵 (如果已變更或清空)
+    if (ActiveKeyHotkey != "" && ActiveKeyHotkey != newKey) {
+        try Hotkey(ActiveKeyHotkey, "Off")
+        ActiveKeyHotkey := ""
+    }
+    if (ActiveMouseHotkey != "" && ActiveMouseHotkey != newMouse) {
+        try Hotkey(ActiveMouseHotkey, "Off")
+        ActiveMouseHotkey := ""
+    }
+    if (ActiveJoyHotkey != "" && ActiveJoyHotkey != newJoy) {
+        try Hotkey(ActiveJoyHotkey, "Off")
+        ActiveJoyHotkey := ""
+    }
+
+    errors := []
+    successList := []
+
+    ; 2. 註冊鍵盤熱鍵
+    if (newKey != "") {
+        try {
+            Hotkey(newKey, (*) => ShowMenu(), "On")
+            ActiveKeyHotkey := newKey
+            KeyHotkey := newKey
+            IniWrite(newKey, IniFile, "Settings", "KeyHotkey")
+            successList.Push("鍵盤: " . HotkeyToHumanReadable(newKey))
+        } catch as err {
+            errors.Push("鍵盤熱鍵 [" . newKey . "] 註冊失敗: " . err.Message)
+        }
+    } else {
+        if (ActiveKeyHotkey != "") {
+            try Hotkey(ActiveKeyHotkey, "Off")
+            ActiveKeyHotkey := ""
+        }
+        KeyHotkey := ""
+        IniWrite("", IniFile, "Settings", "KeyHotkey")
+    }
+
+    ; 3. 註冊滑鼠熱鍵
+    if (newMouse != "") {
+        try {
+            Hotkey(newMouse, (*) => ShowMenu(), "On")
+            ActiveMouseHotkey := newMouse
+            MouseHotkey := newMouse
+            IniWrite(newMouse, IniFile, "Settings", "MouseHotkey")
+            successList.Push("滑鼠: " . HotkeyToHumanReadable(newMouse))
+        } catch as err {
+            errors.Push("滑鼠熱鍵 [" . newMouse . "] 註冊失敗: " . err.Message)
+        }
+    } else {
+        if (ActiveMouseHotkey != "") {
+            try Hotkey(ActiveMouseHotkey, "Off")
+            ActiveMouseHotkey := ""
+        }
+        MouseHotkey := ""
+        IniWrite("", IniFile, "Settings", "MouseHotkey")
+    }
+
+    ; 4. 註冊控制器熱鍵
+    if (newJoy != "") {
+        try {
+            Hotkey(newJoy, (*) => ShowMenu(), "On")
+            ActiveJoyHotkey := newJoy
+            ControllerHotkey := newJoy
+            IniWrite(newJoy, IniFile, "Settings", "ControllerHotkey")
+            successList.Push("控制器: " . HotkeyToHumanReadable(newJoy))
+        } catch as err {
+            errors.Push("控制器按鍵 [" . newJoy . "] 註冊失敗: " . err.Message)
+        }
+    } else {
+        if (ActiveJoyHotkey != "") {
+            try Hotkey(ActiveJoyHotkey, "Off")
+            ActiveJoyHotkey := ""
+        }
+        ControllerHotkey := ""
+        IniWrite("", IniFile, "Settings", "ControllerHotkey")
+    }
+
+    ; 維護舊版 Hotkey 鍵值
+    legacyVal := (KeyHotkey != "") ? KeyHotkey : ((MouseHotkey != "") ? MouseHotkey : ControllerHotkey)
+    IniWrite(legacyVal, IniFile, "Settings", "Hotkey")
+
+    UpdateTrayTip()
+
+    if (!silent) {
+        if (errors.Length > 0) {
+            errMsg := ""
+            for err in errors
+                errMsg .= "• " . err . "`n"
+            MsgBox("部分熱鍵註冊遇到問題：`n`n" . errMsg, "熱鍵註冊提示", "Icon! 48")
+        } else if (successList.Length > 0) {
+            tipMsg := "已成功套用熱鍵設定 (三種熱鍵並存生效)：`n"
+            for s in successList
+                tipMsg .= "• " . s . "`n"
+            ToolTip(Trim(tipMsg))
+            SetTimer ClearToolTip, -3000
+        } else {
+            ToolTip("所有熱鍵已清空 (未啟用任何熱鍵)")
             SetTimer ClearToolTip, -2000
         }
-        return true
-    } catch as err {
-        if (oldHk != "") {
-            try Hotkey(oldHk, (*) => ShowMenu(), "On")
-        }
-        if (!silent) {
-            MsgBox("熱鍵註冊失敗！`n可能是該組合鍵無效或已被系統其他程式佔用。", "熱鍵設定錯誤", "Icon! 16")
-        }
-        return false
     }
+
+    return (errors.Length == 0)
 }
 
 ; ------------------------------------------------------------------------------
-; 熱鍵代碼轉換為易讀文字 (如 ^#z -> Ctrl + Win + Z, ^MButton -> Ctrl + 滑鼠中鍵)
+; 檢查是否為滑鼠/控制器熱鍵
+; ------------------------------------------------------------------------------
+IsMouseHotkey(hk) {
+    if (hk == "")
+        return false
+    lower := StrLower(hk)
+    return InStr(lower, "lbutton") || InStr(lower, "rbutton") || InStr(lower, "mbutton")
+        || InStr(lower, "xbutton1") || InStr(lower, "xbutton2")
+        || InStr(lower, "wheelup") || InStr(lower, "wheeldown")
+}
+
+IsControllerHotkey(hk) {
+    if (hk == "")
+        return false
+    return RegExMatch(hk, "i)^\d*Joy\d+$") ? true : false
+}
+
+GetConnectedControllerInfo() {
+    Loop 16 {
+        name := GetKeyState(A_Index . "JoyName")
+        if (name != "") {
+            btnCount := GetKeyState(A_Index . "JoyButtons")
+            return "🟢 已偵測到控制器 #" . A_Index . ": " . name . (btnCount != "" ? " (" . btnCount . " 按鈕)" : "")
+        }
+    }
+    return "⚪ 目前未偵測到已連線手把 (仍可預先設定按鈕代碼)"
+}
+
+; ------------------------------------------------------------------------------
+; 熱鍵代碼轉換為易讀文字 (支援鍵盤、滑鼠、手把按鈕)
 ; ------------------------------------------------------------------------------
 HotkeyToHumanReadable(hk) {
     if (hk == "")
@@ -118,29 +273,48 @@ HotkeyToHumanReadable(hk) {
         res.Push("Win")
 
     if (temp != "") {
-        mouseMap := Map(
-            "mbutton", "滑鼠中鍵 (MButton)",
-            "rbutton", "滑鼠右鍵 (RButton)",
-            "lbutton", "滑鼠左鍵 (LButton)",
-            "xbutton1", "滑鼠側鍵1 (XButton1)",
-            "xbutton2", "滑鼠側鍵2 (XButton2)",
-            "wheelup", "滾輪向上 (WheelUp)",
-            "wheeldown", "滾輪向下 (WheelDown)"
-        )
-        lowerTemp := StrLower(temp)
-        if (mouseMap.Has(lowerTemp)) {
-            res.Push(mouseMap[lowerTemp])
-        } else if (StrLen(temp) == 1) {
-            res.Push(StrUpper(temp))
+        if RegExMatch(temp, "i)^(\d*)Joy(\d+)$", &m) {
+            devPrefix := (m[1] != "" && m[1] != "1") ? ("搖桿" . m[1] . " ") : ""
+            btnNum := Integer(m[2])
+            joyNames := Map(
+                1, "A / ╳",
+                2, "B / ◯",
+                3, "X / ▢",
+                4, "Y / △",
+                5, "LB / L1",
+                6, "RB / R1",
+                7, "Back / View / Select",
+                8, "Start / Menu / Options",
+                9, "LS / 左搖桿下壓",
+                10, "RS / 右搖桿下壓"
+            )
+            desc := joyNames.Has(btnNum) ? ("手把按鈕 " . btnNum . " [" . joyNames[btnNum] . "]") : ("手把按鈕 " . btnNum . " (Joy" . btnNum . ")")
+            res.Push(devPrefix . desc)
         } else {
-            res.Push(temp)
+            mouseMap := Map(
+                "mbutton", "滑鼠中鍵 (MButton)",
+                "rbutton", "滑鼠右鍵 (RButton)",
+                "lbutton", "滑鼠左鍵 (LButton)",
+                "xbutton1", "滑鼠側鍵1 (XButton1)",
+                "xbutton2", "滑鼠側鍵2 (XButton2)",
+                "wheelup", "滾輪向上 (WheelUp)",
+                "wheeldown", "滾輪向下 (WheelDown)"
+            )
+            lowerTemp := StrLower(temp)
+            if (mouseMap.Has(lowerTemp)) {
+                res.Push(mouseMap[lowerTemp])
+            } else if (StrLen(temp) == 1) {
+                res.Push(StrUpper(temp))
+            } else {
+                res.Push(temp)
+            }
         }
     }
 
-    out := ""
+    outStr := ""
     for i, p in res
-        out .= (i == 1 ? "" : " + ") p
-    return out
+        outStr .= (i == 1 ? "" : " + ") p
+    return outStr
 }
 
 ; ------------------------------------------------------------------------------
@@ -195,9 +369,8 @@ GetIniSections(file) {
 ; 設定視窗 GUI (熱鍵設定、視窗紀錄管理、匯入/匯出)
 ; ------------------------------------------------------------------------------
 ShowSettingsGui(*) {
-    global SettingsGuiObj, CurrentHotkey, HotkeyRecorderHook
+    global SettingsGuiObj, KeyHotkey, MouseHotkey, ControllerHotkey
 
-    ; 若設定視窗已存在則直接啟用焦點
     if (SettingsGuiObj != "") {
         try {
             SettingsGuiObj.Show()
@@ -208,36 +381,128 @@ ShowSettingsGui(*) {
     sg := Gui("+AlwaysOnTop -MinimizeBox", "Sizex - 設定")
     sg.SetFont("s9", "Segoe UI")
 
-    tab := sg.Add("Tab3", "x12 y10 w510 h330", ["⌨️ 熱鍵設定", "📋 視窗紀錄管理", "📂 匯入 / 匯出"])
+    tab := sg.Add("Tab3", "x15 y10 w550 h520", ["🎯 熱鍵設定 (三種並存)", "📋 視窗紀錄管理", "📂 匯入 / 匯出"])
 
-    ; ==================== 分頁 1: 熱鍵設定 ====================
+    ; ==================== 分頁 1: 熱鍵設定 (鍵盤、滑鼠、控制器三種並存) ====================
     tab.UseTab(1)
-    sg.Add("GroupBox", "x25 y45 w480 h170", "呼叫選單熱鍵")
 
-    sg.Add("Text", "x45 y75 w100 h25", "目前熱鍵名稱：")
-    editDisplay := sg.Add("Edit", "x150 y72 w330 h26 ReadOnly Center", HotkeyToHumanReadable(CurrentHotkey))
-    editDisplay.SetFont("s10 bold", "Segoe UI")
+    sg.Add("Text", "x30 y42 w520 h20 cGray", "💡 鍵盤、滑鼠、控制器三種熱鍵各自獨立且並存生效，按任一設定鍵皆可呼叫選單。")
 
-    sg.Add("Text", "x45 y110 w100 h25", "AHK 格式代碼：")
-    txtAhkCode := sg.Add("Edit", "x150 y107 w330 h26 ReadOnly Center", CurrentHotkey)
+    ; --- 1. 鍵盤熱鍵群組 ---
+    sg.Add("GroupBox", "x30 y65 w520 h115", "⌨️ 鍵盤熱鍵 (Keyboard)")
 
-    btnRecord := sg.Add("Button", "x45 y150 w435 h42", "🎯 點擊開始錄製按鍵 (支援鍵盤組合鍵與滑鼠按鍵)")
-    btnRecord.SetFont("s10 bold", "Segoe UI")
+    sg.Add("Text", "x45 y95 w75 h20", "目前熱鍵：")
+    editKeyDisplay := sg.Add("Edit", "x125 y92 w230 h26 ReadOnly Center", HotkeyToHumanReadable(KeyHotkey))
+    editKeyDisplay.SetFont("s10 bold", "Segoe UI")
 
-    btnSaveHk := sg.Add("Button", "x45 y230 w150 h36 Default", "💾 儲存並套用熱鍵")
-    btnResetHk := sg.Add("Button", "x210 y230 w150 h36", "🔄 重設預設 (^#z)")
+    sg.Add("Text", "x365 y95 w45 h20", "代碼：")
+    txtKeyCode := sg.Add("Edit", "x415 y92 w115 h26 Center", KeyHotkey)
 
-    btnRecord.OnEvent("Click", (*) => StartHotkeyRecording(btnRecord, editDisplay, txtAhkCode))
-    btnSaveHk.OnEvent("Click", (*) => OnSaveSettings(txtAhkCode.Value))
-    btnResetHk.OnEvent("Click", (*) => OnResetSettings(btnRecord, editDisplay, txtAhkCode))
+    btnRecordKey := sg.Add("Button", "x125 y130 w155 h32", "🎯 錄製鍵盤組合鍵")
+    btnRecordKey.SetFont("s9 bold", "Segoe UI")
+    btnClearKey := sg.Add("Button", "x290 y130 w80 h32", "❌ 清除")
+    btnResetKey := sg.Add("Button", "x380 y130 w120 h32", "🔄 預設 (^#z)")
+
+    txtKeyCode.OnEvent("Change", (ctrl, *) => editKeyDisplay.Value := HotkeyToHumanReadable(ctrl.Value))
+    btnRecordKey.OnEvent("Click", (*) => StartKeyRecording(btnRecordKey, editKeyDisplay, txtKeyCode))
+    btnClearKey.OnEvent("Click", (*) => (txtKeyCode.Value := "", editKeyDisplay.Value := HotkeyToHumanReadable("")))
+    btnResetKey.OnEvent("Click", (*) => (txtKeyCode.Value := "^#z", editKeyDisplay.Value := HotkeyToHumanReadable("^#z")))
+
+    ; --- 2. 滑鼠熱鍵群組 ---
+    sg.Add("GroupBox", "x30 y190 w520 h125", "🖱️ 滑鼠熱鍵 (Mouse)")
+
+    sg.Add("Text", "x45 y218 w75 h20", "目前熱鍵：")
+    editMouseDisplay := sg.Add("Edit", "x125 y215 w230 h26 ReadOnly Center", HotkeyToHumanReadable(MouseHotkey))
+    editMouseDisplay.SetFont("s10 bold", "Segoe UI")
+
+    sg.Add("Text", "x365 y218 w45 h20", "代碼：")
+    txtMouseCode := sg.Add("Edit", "x415 y215 w115 h26 Center", MouseHotkey)
+
+    btnRecordMouse := sg.Add("Button", "x125 y252 w135 h32", "🎯 錄製滑鼠鍵")
+    btnRecordMouse.SetFont("s9 bold", "Segoe UI")
+
+    mousePresets := [
+        "(快速選取滑鼠按鍵...)",
+        "XButton2 (側鍵2 / 前進鍵)",
+        "XButton1 (側鍵1 / 後退鍵)",
+        "MButton (滾輪中鍵)",
+        "WheelUp (滾輪向上)",
+        "WheelDown (滾輪向下)",
+        "^MButton (Ctrl + 滾輪中鍵)",
+        "+MButton (Shift + 滾輪中鍵)",
+        "!MButton (Alt + 滾輪中鍵)",
+        "^XButton2 (Ctrl + 側鍵2)",
+        "^XButton1 (Ctrl + 側鍵1)",
+        "RButton (滑鼠右鍵)"
+    ]
+    ddlMouse := sg.Add("DropDownList", "x270 y253 w175", mousePresets)
+    SyncDropdownToValue(ddlMouse, mousePresets, MouseHotkey)
+
+    btnClearMouse := sg.Add("Button", "x455 y252 w75 h32", "❌ 清除")
+
+    sg.Add("Text", "x125 y290 w405 h18 cGray", "※ 支援側鍵 XButton1/2、滾輪中鍵 MButton、滾輪滾動，可搭配 Ctrl/Alt/Shift")
+
+    txtMouseCode.OnEvent("Change", (ctrl, *) => (editMouseDisplay.Value := HotkeyToHumanReadable(ctrl.Value), SyncDropdownToValue(ddlMouse, mousePresets, ctrl.Value)))
+    ddlMouse.OnEvent("Change", (ctrl, *) => OnDropdownSelect(ctrl, txtMouseCode, editMouseDisplay))
+    btnRecordMouse.OnEvent("Click", (*) => StartMouseRecording(btnRecordMouse, editMouseDisplay, txtMouseCode, ddlMouse, mousePresets))
+    btnClearMouse.OnEvent("Click", (*) => (txtMouseCode.Value := "", editMouseDisplay.Value := HotkeyToHumanReadable(""), ddlMouse.Choose(1)))
+
+    ; --- 3. 控制器 / 手把熱鍵群組 ---
+    sg.Add("GroupBox", "x30 y325 w520 h140", "🎮 控制器 / 手把熱鍵 (Controller / Gamepad)")
+
+    sg.Add("Text", "x45 y353 w75 h20", "目前熱鍵：")
+    editJoyDisplay := sg.Add("Edit", "x125 y350 w230 h26 ReadOnly Center", HotkeyToHumanReadable(ControllerHotkey))
+    editJoyDisplay.SetFont("s10 bold", "Segoe UI")
+
+    sg.Add("Text", "x365 y353 w45 h20", "代碼：")
+    txtJoyCode := sg.Add("Edit", "x415 y350 w115 h26 Center", ControllerHotkey)
+
+    btnRecordJoy := sg.Add("Button", "x125 y388 w135 h32", "🎯 錄製手把按鍵")
+    btnRecordJoy.SetFont("s9 bold", "Segoe UI")
+
+    joyPresets := [
+        "(快速選取手把按鍵...)",
+        "Joy8 (Start / Menu / Options)",
+        "Joy7 (Back / View / Select)",
+        "Joy9 (LS / 左搖桿下壓 L3)",
+        "Joy10 (RS / 右搖桿下壓 R3)",
+        "Joy5 (LB / 左肩鍵 L1)",
+        "Joy6 (RB / 右肩鍵 R1)",
+        "Joy1 (A / ╳ 按鈕)",
+        "Joy2 (B / ◯ 按鈕)",
+        "Joy3 (X / ▢ 按鈕)",
+        "Joy4 (Y / △ 按鈕)",
+        "Joy11 (按鈕 11)",
+        "Joy12 (按鈕 12)",
+        "Joy13 (按鈕 13)",
+        "Joy14 (按鈕 14)",
+        "Joy15 (按鈕 15)",
+        "Joy16 (按鈕 16)"
+    ]
+    ddlJoy := sg.Add("DropDownList", "x270 y389 w175", joyPresets)
+    SyncDropdownToValue(ddlJoy, joyPresets, ControllerHotkey)
+
+    btnClearJoy := sg.Add("Button", "x455 y388 w75 h32", "❌ 清除")
+
+    txtJoyStatus := sg.Add("Text", "x125 y428 w405 h22 cNavy", GetConnectedControllerInfo())
+
+    txtJoyCode.OnEvent("Change", (ctrl, *) => (editJoyDisplay.Value := HotkeyToHumanReadable(ctrl.Value), SyncDropdownToValue(ddlJoy, joyPresets, ctrl.Value)))
+    ddlJoy.OnEvent("Change", (ctrl, *) => OnDropdownSelect(ctrl, txtJoyCode, editJoyDisplay))
+    btnRecordJoy.OnEvent("Click", (*) => StartJoyRecording(btnRecordJoy, editJoyDisplay, txtJoyCode, ddlJoy, joyPresets))
+    btnClearJoy.OnEvent("Click", (*) => (txtJoyCode.Value := "", editJoyDisplay.Value := HotkeyToHumanReadable(""), ddlJoy.Choose(1)))
+
+    ; --- 儲存按鈕 ---
+    btnSaveAllHk := sg.Add("Button", "x145 y475 w290 h38 Default", "💾 儲存並套用所有熱鍵 (鍵盤/滑鼠/控制器)")
+    btnSaveAllHk.SetFont("s10 bold", "Segoe UI")
+    btnSaveAllHk.OnEvent("Click", (*) => ApplyAllHotkeys(txtKeyCode.Value, txtMouseCode.Value, txtJoyCode.Value))
 
     ; ==================== 分頁 2: 視窗紀錄管理 ====================
     tab.UseTab(2)
-    lvProfiles := sg.Add("ListView", "x25 y45 w480 h210 Grid -Multi", ["名稱", "X", "Y", "寬度 (W)", "高度 (H)", "進程名稱 (Exe)"])
-    
-    btnDeleteSelected := sg.Add("Button", "x25 y265 w135 h35", "🗑️ 刪除選取紀錄")
-    btnClearAll := sg.Add("Button", "x170 y265 w135 h35", "🧹 清空所有紀錄")
-    btnRefreshLv := sg.Add("Button", "x315 y265 w100 h35", "🔄 重新整理")
+    lvProfiles := sg.Add("ListView", "x30 y45 w520 h415 Grid -Multi", ["名稱", "X", "Y", "寬度 (W)", "高度 (H)", "進程名稱 (Exe)"])
+
+    btnDeleteSelected := sg.Add("Button", "x30 y475 w145 h36", "🗑️ 刪除選取紀錄")
+    btnClearAll := sg.Add("Button", "x185 y475 w145 h36", "🧹 清空所有紀錄")
+    btnRefreshLv := sg.Add("Button", "x340 y475 w110 h36", "🔄 重新整理")
 
     RefreshProfileListView(lvProfiles)
 
@@ -247,17 +512,17 @@ ShowSettingsGui(*) {
 
     ; ==================== 分頁 3: 匯入 / 匯出 ====================
     tab.UseTab(3)
-    sg.Add("GroupBox", "x25 y45 w480 h220", "設定檔備份與遷移")
+    sg.Add("GroupBox", "x30 y45 w520 h420", "設定檔備份與遷移")
 
-    sg.Add("Text", "x45 y75 w440 h40", "您可以將目前的視窗設定匯出為 INI 備份檔案，或是從其他 INI 檔案匯入並合併設定。")
+    sg.Add("Text", "x50 y85 w480 h40", "您可以將目前的視窗設定匯出為 INI 備份檔案，或是從其他 INI 檔案匯入並合併設定。")
 
-    btnImport := sg.Add("Button", "x45 y125 w205 h42", "📂 匯入 INI 設定檔")
+    btnImport := sg.Add("Button", "x50 y145 w225 h45", "📂 匯入 INI 設定檔")
     btnImport.SetFont("s10 bold", "Segoe UI")
 
-    btnExport := sg.Add("Button", "x270 y125 w205 h42", "💾 匯出目前 INI 設定檔")
+    btnExport := sg.Add("Button", "x285 y145 w225 h45", "💾 匯出目前 INI 設定檔")
     btnExport.SetFont("s10 bold", "Segoe UI")
 
-    btnOpenIni := sg.Add("Button", "x45 y185 w430 h35", "📝 開啟目前 INI 檔案編輯")
+    btnOpenIni := sg.Add("Button", "x50 y215 w460 h38", "📝 開啟目前 INI 檔案編輯")
 
     btnImport.OnEvent("Click", (*) => ImportIniFile(lvProfiles))
     btnExport.OnEvent("Click", (*) => ExportIniFile())
@@ -265,34 +530,95 @@ ShowSettingsGui(*) {
 
     ; ==================== 底部通用按鈕 ====================
     tab.UseTab()
-    btnClose := sg.Add("Button", "x405 y350 w115 h35", "關閉")
+    btnClose := sg.Add("Button", "x440 y538 w125 h34", "關閉視窗")
     btnClose.OnEvent("Click", (*) => OnSettingsClose(sg))
 
     sg.OnEvent("Close", OnSettingsClose)
-    sg.OnEvent("Escape", OnSettingsClose)
+    sg.OnEvent("Escape", (guiObj, *) => (RecordingType != "" ? StopAllRecording() : OnSettingsClose(guiObj)))
 
     SettingsGuiObj := sg
-    sg.Show("w535 h395")
+    sg.Show("w580 h580")
 }
 
 ; ------------------------------------------------------------------------------
-; 熱鍵與滑鼠錄製功能
+; 下拉選單與同步輔助函式
 ; ------------------------------------------------------------------------------
-StartHotkeyRecording(btnRecord, editDisplay, txtAhkCode) {
-    global HotkeyRecorderHook
+OnDropdownSelect(ctrl, codeCtrl, dispCtrl) {
+    sel := ctrl.Text
+    if (RegExMatch(sel, "^([^\s]+)", &m)) {
+        val := m[1]
+        if (SubStr(val, 1, 1) = "(")
+            return
+        codeCtrl.Value := val
+        dispCtrl.Value := HotkeyToHumanReadable(val)
+    }
+}
+
+SyncDropdownToValue(ddl, presetArray, targetVal) {
+    if (!ddl || targetVal == "") {
+        try ddl.Choose(1)
+        return
+    }
+    for i, item in presetArray {
+        if (RegExMatch(item, "^([^\s]+)", &m) && StrCompare(m[1], targetVal, false) == 0) {
+            try ddl.Choose(i)
+            return
+        }
+    }
+    try ddl.Choose(1)
+}
+
+; ------------------------------------------------------------------------------
+; 熱鍵錄製功能 (鍵盤、滑鼠、控制器個別錄製)
+; ------------------------------------------------------------------------------
+StartKeyRecording(btn, disp, code) {
+    global RecordingType, ActiveInputHook, RecControls
     StopAllRecording()
 
-    btnRecord.Text := "🔴 請按下按鍵或滑鼠鍵... (按 Esc 取消)"
-    btnRecord.Enabled := false
+    RecordingType := "Key"
+    RecControls := { btn: btn, disp: disp, code: code, defText: "🎯 錄製鍵盤組合鍵" }
+    btn.Text := "🔴 請按下鍵盤鍵... (Esc取消)"
+    btn.Enabled := false
 
-    ; 1. 啟用鍵盤輸入監聽
-    HotkeyRecorderHook := InputHook("V")
-    HotkeyRecorderHook.KeyOpt("{All}", "+N +S")
-    HotkeyRecorderHook.OnKeyDown := (hook, vk, sc) => ProcessRecordKeyDown(hook, vk, sc, btnRecord, editDisplay, txtAhkCode)
-    HotkeyRecorderHook.Start()
+    ActiveInputHook := InputHook("V")
+    ActiveInputHook.KeyOpt("{All}", "+N +S")
+    ActiveInputHook.OnKeyDown := ProcessKeyRecorded
+    ActiveInputHook.Start()
+}
 
-    ; 2. 啟用滑鼠按鍵監聽
-    ToggleMouseRecorder(true, (thisHk) => ProcessMouseKeyDown(thisHk, btnRecord, editDisplay, txtAhkCode))
+StartMouseRecording(btn, disp, code, ddl, presets) {
+    global RecordingType, ActiveInputHook, RecControls
+    StopAllRecording()
+
+    RecordingType := "Mouse"
+    RecControls := { btn: btn, disp: disp, code: code, ddl: ddl, presets: presets, defText: "🎯 錄製滑鼠鍵" }
+    btn.Text := "🔴 請點擊滑鼠鍵... (Esc取消)"
+    btn.Enabled := false
+
+    ActiveInputHook := InputHook("V")
+    ActiveInputHook.KeyOpt("{Escape}", "+N +S")
+    ActiveInputHook.OnKeyDown := (*) => StopAllRecording()
+    ActiveInputHook.Start()
+
+    ToggleMouseRecorder(true, ProcessMouseRecorded)
+}
+
+StartJoyRecording(btn, disp, code, ddl, presets) {
+    global RecordingType, ActiveInputHook, JoyPollActive, RecControls
+    StopAllRecording()
+
+    RecordingType := "Joy"
+    RecControls := { btn: btn, disp: disp, code: code, ddl: ddl, presets: presets, defText: "🎯 錄製手把按鍵" }
+    btn.Text := "🔴 請按下手把鍵... (Esc取消)"
+    btn.Enabled := false
+
+    ActiveInputHook := InputHook("V")
+    ActiveInputHook.KeyOpt("{Escape}", "+N +S")
+    ActiveInputHook.OnKeyDown := (*) => StopAllRecording()
+    ActiveInputHook.Start()
+
+    JoyPollActive := true
+    SetTimer PollJoyRecord, 25
 }
 
 ToggleMouseRecorder(enable, callback := "") {
@@ -308,22 +634,36 @@ ToggleMouseRecorder(enable, callback := "") {
 }
 
 StopAllRecording() {
-    global HotkeyRecorderHook
-    if (HotkeyRecorderHook != "") {
-        try HotkeyRecorderHook.Stop()
-        HotkeyRecorderHook := ""
+    global RecordingType, ActiveInputHook, JoyPollActive, RecControls
+
+    if (ActiveInputHook != "") {
+        try ActiveInputHook.Stop()
+        ActiveInputHook := ""
     }
     ToggleMouseRecorder(false)
+
+    if (JoyPollActive) {
+        SetTimer PollJoyRecord, 0
+        JoyPollActive := false
+    }
+
+    if (RecControls.HasProp("btn") && RecControls.btn) {
+        try {
+            RecControls.btn.Text := RecControls.defText
+            RecControls.btn.Enabled := true
+        }
+    }
+    RecordingType := ""
+    RecControls := {}
 }
 
-ProcessRecordKeyDown(hook, vk, sc, btnRecord, editDisplay, txtAhkCode) {
+ProcessKeyRecorded(hook, vk, sc) {
+    global RecControls
     keyName := GetKeyName(Format("vk{:02x}sc{:03x}", vk, sc))
 
     ; 按 Esc 取消錄製
     if (keyName = "Escape" && !GetKeyState("Ctrl", "P") && !GetKeyState("Alt", "P") && !GetKeyState("Shift", "P") && !GetKeyState("LWin", "P") && !GetKeyState("RWin", "P")) {
         StopAllRecording()
-        btnRecord.Text := "🎯 點擊開始錄製按鍵 (支援鍵盤組合鍵與滑鼠按鍵)"
-        btnRecord.Enabled := true
         return
     }
 
@@ -335,7 +675,6 @@ ProcessRecordKeyDown(hook, vk, sc, btnRecord, editDisplay, txtAhkCode) {
         return
     }
 
-    ; 取得修飾鍵
     modStr := ""
     if GetKeyState("Ctrl", "P")
         modStr .= "^"
@@ -349,18 +688,22 @@ ProcessRecordKeyDown(hook, vk, sc, btnRecord, editDisplay, txtAhkCode) {
     baseKey := (StrLen(keyName) == 1) ? StrLower(keyName) : keyName
     capturedHk := modStr . baseKey
 
+    btn := RecControls.btn
+    disp := RecControls.disp
+    code := RecControls.code
+
     StopAllRecording()
 
-    editDisplay.Value := HotkeyToHumanReadable(capturedHk)
-    txtAhkCode.Value := capturedHk
-    btnRecord.Text := "🎯 點擊重新錄製按鍵"
-    btnRecord.Enabled := true
+    if (code)
+        code.Value := capturedHk
+    if (disp)
+        disp.Value := HotkeyToHumanReadable(capturedHk)
 }
 
-ProcessMouseKeyDown(thisHk, btnRecord, editDisplay, txtAhkCode) {
+ProcessMouseRecorded(thisHk) {
+    global RecControls
     cleanHk := RegExReplace(thisHk, "^\*")
 
-    ; 若無修飾鍵且點擊左鍵，視為一般點擊操作不進行綁定
     hasMod := (GetKeyState("Ctrl", "P") || GetKeyState("Alt", "P") || GetKeyState("Shift", "P") || GetKeyState("LWin", "P") || GetKeyState("RWin", "P"))
     if (cleanHk = "LButton" && !hasMod) {
         return
@@ -378,22 +721,55 @@ ProcessMouseKeyDown(thisHk, btnRecord, editDisplay, txtAhkCode) {
 
     capturedHk := modStr . cleanHk
 
+    disp := RecControls.disp
+    code := RecControls.code
+    ddl := RecControls.HasProp("ddl") ? RecControls.ddl : ""
+    presets := RecControls.HasProp("presets") ? RecControls.presets : []
+
     StopAllRecording()
 
-    editDisplay.Value := HotkeyToHumanReadable(capturedHk)
-    txtAhkCode.Value := capturedHk
-    btnRecord.Text := "🎯 點擊重新錄製按鍵"
-    btnRecord.Enabled := true
+    if (code)
+        code.Value := capturedHk
+    if (disp)
+        disp.Value := HotkeyToHumanReadable(capturedHk)
+    if (ddl && presets.Length > 0)
+        SyncDropdownToValue(ddl, presets, capturedHk)
 }
 
-OnSaveSettings(newHk) {
-    ApplyGlobalHotkey(newHk)
-}
+PollJoyRecord() {
+    global RecControls, JoyPollActive
+    if (!JoyPollActive)
+        return
 
-OnResetSettings(btnRecord, editDisplay, txtAhkCode) {
-    editDisplay.Value := HotkeyToHumanReadable("^#z")
-    txtAhkCode.Value := "^#z"
-    btnRecord.Text := "🎯 點擊開始錄製按鍵 (支援鍵盤組合鍵與滑鼠按鍵)"
+    Loop 16 {
+        joyIndex := A_Index
+        bCount := GetKeyState(joyIndex . "JoyButtons")
+        if (bCount == "")
+            continue
+
+        maxBtn := (bCount > 0) ? Min(Integer(bCount), 32) : 32
+        Loop maxBtn {
+            btnIndex := A_Index
+            if (GetKeyState(joyIndex . "Joy" . btnIndex) == 1) {
+                capturedHk := (joyIndex == 1) ? ("Joy" . btnIndex) : (joyIndex . "Joy" . btnIndex)
+
+                disp := RecControls.disp
+                code := RecControls.code
+                ddl := RecControls.HasProp("ddl") ? RecControls.ddl : ""
+                presets := RecControls.HasProp("presets") ? RecControls.presets : []
+
+                StopAllRecording()
+
+                if (code)
+                    code.Value := capturedHk
+                if (disp)
+                    disp.Value := HotkeyToHumanReadable(capturedHk)
+                if (ddl && presets.Length > 0)
+                    SyncDropdownToValue(ddl, presets, capturedHk)
+                return
+            }
+        }
+    }
 }
 
 OnSettingsClose(guiObj, *) {
@@ -419,13 +795,14 @@ RefreshProfileListView(lv) {
         iExe := IniRead(IniFile, sec, "Exe", "")
         lv.Add(, sec, iX, iY, iW, iH, iExe)
     }
-    lv.ModifyCol(1, 130)
-    lv.ModifyCol(2, 50)
-    lv.ModifyCol(3, 50)
-    lv.ModifyCol(4, 75)
-    lv.ModifyCol(5, 75)
-    lv.ModifyCol(6, 90)
+    lv.ModifyCol(1, 140)
+    lv.ModifyCol(2, 55)
+    lv.ModifyCol(3, 55)
+    lv.ModifyCol(4, 80)
+    lv.ModifyCol(5, 80)
+    lv.ModifyCol(6, 100)
 }
+
 
 DeleteSelectedProfile(lv) {
     row := lv.GetNext(0)
